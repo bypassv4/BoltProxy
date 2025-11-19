@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "public",
+    "rootDir": "src",
+    "module": "ES2020",
+    "target": "ES2020",
+  "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "skipLibCheck": true,
+    "noEmitOnError": true,
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": false
+  },
+  "include": ["src/runtime.ts"],
+  "exclude": []
+}

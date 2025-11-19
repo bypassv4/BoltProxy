@@ -8,8 +8,8 @@
     "rootDir": "src",
     "outDir": "dist",
     "lib": ["ES2020", "DOM"],
-    "skipLibCheck": true,
-    "verbatimModuleSyntax": false
+    "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src/**/*"],
+  "exclude": ["dist", "node_modules"]
 }

@@ -1,130 +1,257 @@
-import express, { Request, Response } from "express"
-import path from "path"
-import http from "http"
-import axios from "axios"
-import https from "https"
-import { URL } from "url"
+import express, { Request, Response } from "express";
+import axios, { AxiosRequestConfig } from "axios";
+import path from "path";
+import { URL } from "url";
+import http from "http";
+import https from "https";
+import WebSocket, { WebSocketServer } from "ws";
 
-const app = express()
-const PORT = 8080
+import { rewriteHtml, rewriteJs, rewriteCss } from "./rewriter";
 
-const agent = new https.Agent({ rejectUnauthorized: false })
+const app = express();
+const PORT = Number(process.env.PORT || 8080);
 
-const pub = path.join(__dirname, "..", "public")
-app.use(express.static(pub))
+app.use(
+  express.raw({
+    type: "*/*",
+    limit: "25mb"
+  })
+);
 
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(pub, "index.html"))
-})
+const httpAgent = new http.Agent({ keepAlive: true });
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  rejectUnauthorized: false
+});
 
-function norm(u: string) {
-  const t = u.trim()
-  if (!/^https?:\/\//i.test(t)) return "https://" + t
-  return t
+app.use(express.static(path.join(__dirname, "..", "public")));
+
+function setCommonHeaders(res: Response) {
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-credentials", "true");
+  res.setHeader("cross-origin-opener-policy", "unsafe-none");
+  res.setHeader("cross-origin-embedder-policy", "unsafe-none");
+  res.setHeader("cross-origin-resource-policy", "cross-origin");
 }
 
-function skip(u: string) {
-  const x = u.toLowerCase()
-  return (
-    x.startsWith("javascript:") ||
-    x.startsWith("mailto:") ||
-    x.startsWith("tel:") ||
-    x.startsWith("#")
-  )
-}
+function sanitizeRequestHeaders(
+  req: Request,
+  target: URL
+): Record<string, string> {
+  const out: Record<string, string> = {};
 
-function abs(v: string, base: URL) {
-  if (v.startsWith("//")) return base.protocol + v
-  if (/^https?:\/\//i.test(v)) return v
-  if (v.startsWith("/")) return base.origin + v
-  return new URL(v, base).href
-}
-
-function rewriteUrl(v: string, base: URL) {
-  if (!v || skip(v)) return v
-  const real = abs(v, base)
-  return "/proxy?url=" + encodeURIComponent(real)
-}
-
-function rewriteAll(t: string, base: string) {
-  const b = new URL(base)
-  let r = t
-
-  r = r.replace(/(href|src)=["']([^"']+)["']/gi, (_, a, v) => `${a}="${rewriteUrl(v, b)}"`)
-
-  r = r.replace(/action=["']([^"']+)["']/gi, (_, v) => `action="${rewriteUrl(v, b)}"`)
-
-  r = r.replace(/formaction=["']([^"']+)["']/gi, (_, v) => `formaction="${rewriteUrl(v, b)}"`)
-
-  r = r.replace(/import\s*["']([^"']+)["']/gi, (_, v) => `import "${rewriteUrl(v, b)}"`)
-
-  r = r.replace(/fetch\(["']([^"']+)["']/gi, (_, v) => `fetch("${rewriteUrl(v, b)}"`)
-
-  r = r.replace(/url\(["']?([^"')]+)["']?\)/gi, (_, v) => `url(${rewriteUrl(v, b)})`)
-
-  return r
-}
-
-function buildHeaders(h: any) {
-  const out: any = {}
-  for (const k in h) {
-    const low = k.toLowerCase()
-    if (low === "host") continue
-    if (low === "content-length") continue
-    out[k] = h[k]
-  }
-  return out
-}
-
-app.use("/proxy", async (req: Request, res: Response) => {
-  try {
-    const raw = req.query.url
-    if (!raw || typeof raw !== "string") {
-      res.status(400).send("Missing url")
-      return
-    }
-
-    const target = norm(raw)
-    const url = new URL(target)
-
-    const ax = await axios({
-      method: req.method,
-      url: target,
-      data: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
-      headers: buildHeaders(req.headers),
-      responseType: "arraybuffer",
-      validateStatus: () => true,
-      httpsAgent: agent
-    })
-
-    const type = ax.headers["content-type"] || ""
-    res.set("content-type", type)
-    res.set("access-control-allow-origin", "*")
-    res.set("access-control-allow-headers", "*")
-    res.set("access-control-allow-methods", "*")
-
-    if (req.method === "OPTIONS") {
-      res.status(200).end()
-      return
-    }
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value == null) continue;
+    const lower = name.toLowerCase();
 
     if (
-      type.includes("text/html") ||
-      type.includes("application/javascript") ||
-      type.includes("text/javascript") ||
-      type.includes("text/css")
-    ) {
-      const txt = ax.data.toString("utf8")
-      const out = rewriteAll(txt, target)
-      res.send(out)
-    } else {
-      res.send(Buffer.from(ax.data))
-    }
-  } catch (e: any) {
-    res.status(500).send("Proxy error: " + e.message)
-  }
-})
+      [
+        "host",
+        "connection",
+        "content-length",
+        "accept-encoding",
+        "upgrade",
+        "origin"
+      ].includes(lower)
+    )
+      continue;
 
-http.createServer(app).listen(PORT, () => {
-  console.log("Proxy running at http://localhost:" + PORT)
-})
+    if (Array.isArray(value)) out[name] = value.join(", ");
+    else out[name] = String(value);
+  }
+
+  out["accept-encoding"] = "identity";
+  out["host"] = target.host;
+  if (!out["user-agent"]) {
+    out["user-agent"] =
+      "Mozilla/5.0 (compatible; scramjet-lite-proxy/1.0; +https://example.com)";
+  }
+
+  return out;
+}
+
+function stripDangerousResponseHeaders(
+  upstreamHeaders: Record<string, any>,
+  res: Response
+) {
+  for (const [name, value] of Object.entries(upstreamHeaders)) {
+    if (value == null) continue;
+    const lower = name.toLowerCase();
+
+    if (
+      [
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "x-frame-options",
+        "x-content-type-options",
+        "strict-transport-security",
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+        "connection"
+      ].includes(lower)
+    ) {
+      continue;
+    }
+
+    res.setHeader(name, value as any);
+  }
+}
+
+app.get("/", (_req, res) => {
+  res.send(
+    `<!doctype html>
+<html>
+<head><title>BoltProxy</title></head>
+<body>
+  <h1>BoltProxy</h1>
+  <form method="GET" action="/proxy">
+    <input type="text" name="url" placeholder="https://discord.com" style="width:300px" />
+    <button type="submit">Go</button>
+  </form>
+</body>
+</html>`
+  );
+});
+
+app.all("/proxy", async (req: Request, res: Response) => {
+  const raw = String(req.query.url || "");
+  if (!raw) {
+    res.status(400).send("Missing ?url=");
+    return;
+  }
+
+  let target: URL;
+  try {
+    target = new URL(raw);
+  } catch {
+    res.status(400).send("Invalid URL");
+    return;
+  }
+
+  const headers = sanitizeRequestHeaders(req, target);
+
+  const config: AxiosRequestConfig = {
+    url: target.href,
+    method: req.method as any,
+    headers,
+    responseType: "arraybuffer",
+    validateStatus: () => true,
+    httpAgent,
+    httpsAgent
+  };
+
+  if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+    config.data = req.body;
+  }
+
+  try {
+    const upstream = await axios(config);
+
+    const status = upstream.status;
+    const ct = String(upstream.headers["content-type"] || "");
+    const isHtml = ct.includes("text/html");
+    const isJs =
+      ct.includes("application/javascript") || ct.includes("text/javascript");
+    const isCss = ct.includes("text/css");
+
+    stripDangerousResponseHeaders(upstream.headers, res);
+    setCommonHeaders(res);
+
+    const buf: Buffer = upstream.data as Buffer;
+
+    if (isHtml || isJs || isCss) {
+      let text = buf.toString("utf8");
+      if (isHtml) text = rewriteHtml(text, target);
+      else if (isJs) text = rewriteJs(text, target);
+      else if (isCss) text = rewriteCss(text, target);
+
+      const safeCt =
+        ct.replace(/;\s*charset=[^;]+/i, "") + "; charset=utf-8";
+      res.status(status).setHeader("content-type", safeCt);
+      res.send(text);
+    } else {
+      res.status(status);
+      res.send(buf);
+    }
+  } catch (err: any) {
+    console.error("Proxy error:", err?.message || err);
+    res.status(502).send("Upstream error");
+  }
+});
+
+/**
+ * WebSocket proxy for things like Discord gateways, etc.
+ *
+ * runtime.js wraps WebSocket URLs with /proxy_ws?url=...
+ */
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url || "", "http://local/");
+    if (url.pathname !== "/proxy_ws") {
+      socket.destroy();
+      return;
+    }
+
+    const raw = url.searchParams.get("url");
+    if (!raw) {
+      socket.destroy();
+      return;
+    }
+
+    let target: URL;
+    try {
+      target = new URL(raw);
+    } catch {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket as any, head, (client) => {
+      const upstream = new WebSocket(target.href, {
+        rejectUnauthorized: false,
+        headers: {
+          "User-Agent":
+            req.headers["user-agent"] || "Mozilla/5.0 scramjet-lite-ws"
+        }
+      });
+
+      upstream.on("open", () => {
+        client.on("message", (msg) => upstream.send(msg));
+      });
+
+      upstream.on("message", (msg) => {
+        try {
+          client.send(msg);
+        } catch {
+        }
+      });
+
+      const closeBoth = () => {
+        try {
+          client.close();
+        } catch {}
+        try {
+          upstream.close();
+        } catch {}
+      };
+
+      upstream.on("close", closeBoth);
+      upstream.on("error", closeBoth);
+      client.on("close", closeBoth);
+      client.on("error", closeBoth);
+    });
+  } catch (e) {
+    console.error("WS upgrade error:", e);
+    try {
+      socket.destroy();
+    } catch {}
+  }
+});
+
+server.listen(PORT, () => {
+  console.log("Proxy running on http://localhost:" + PORT);
+});
