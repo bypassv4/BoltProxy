@@ -58,5 +58,3 @@ npm run clean
 ├── tsconfig.json    # TypeScript compiler configuration
 └── package.json
 ```
-
-Happy hacking! 🎯
