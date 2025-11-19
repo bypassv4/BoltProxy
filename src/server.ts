@@ -4,9 +4,9 @@ import path from "path";
 import { URL } from "url";
 import http from "http";
 import https from "https";
-import WebSocket, { WebSocketServer } from "ws";
+import WebSocket from "ws";
 
-import { rewriteHtml, rewriteJs, rewriteCss } from "./rewriter";
+import { rewriteHtml, rewriteJs, rewriteCss } from "./rewriters";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
@@ -34,47 +34,41 @@ function setCommonHeaders(res: Response) {
   res.setHeader("cross-origin-resource-policy", "cross-origin");
 }
 
-function sanitizeRequestHeaders(
-  req: Request,
-  target: URL
-): Record<string, string> {
+function sanitizeRequestHeaders(req: Request, target: URL) {
   const out: Record<string, string> = {};
 
   for (const [name, value] of Object.entries(req.headers)) {
     if (value == null) continue;
-    const lower = name.toLowerCase();
 
+    const lower = name.toLowerCase();
     if (
       [
         "host",
         "connection",
         "content-length",
         "accept-encoding",
-        "upgrade",
-        "origin"
+        "upgrade"
       ].includes(lower)
     )
       continue;
 
-    if (Array.isArray(value)) out[name] = value.join(", ");
-    else out[name] = String(value);
+    out[name] = Array.isArray(value) ? value.join(", ") : String(value);
   }
 
   out["accept-encoding"] = "identity";
   out["host"] = target.host;
+  out["origin"] = target.origin;
+
   if (!out["user-agent"]) {
     out["user-agent"] =
-      "Mozilla/5.0 (compatible; scramjet-lite-proxy/1.0; +https://example.com)";
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132 Safari/537.36";
   }
 
   return out;
 }
 
-function stripDangerousResponseHeaders(
-  upstreamHeaders: Record<string, any>,
-  res: Response
-) {
-  for (const [name, value] of Object.entries(upstreamHeaders)) {
+function stripDangerousResponseHeaders(upHeaders: any, res: Response) {
+  for (const [name, value] of Object.entries(upHeaders)) {
     if (value == null) continue;
     const lower = name.toLowerCase();
 
@@ -90,43 +84,22 @@ function stripDangerousResponseHeaders(
         "transfer-encoding",
         "connection"
       ].includes(lower)
-    ) {
+    )
       continue;
-    }
 
     res.setHeader(name, value as any);
   }
 }
 
-app.get("/", (_req, res) => {
-  res.send(
-    `<!doctype html>
-<html>
-<head><title>BoltProxy</title></head>
-<body>
-  <h1>BoltProxy</h1>
-  <form method="GET" action="/proxy">
-    <input type="text" name="url" placeholder="https://discord.com" style="width:300px" />
-    <button type="submit">Go</button>
-  </form>
-</body>
-</html>`
-  );
-});
-
-app.all("/proxy", async (req: Request, res: Response) => {
+app.all("/proxy", async (req, res) => {
   const raw = String(req.query.url || "");
-  if (!raw) {
-    res.status(400).send("Missing ?url=");
-    return;
-  }
+  if (!raw) return res.status(400).send("Missing ?url=");
 
   let target: URL;
   try {
     target = new URL(raw);
   } catch {
-    res.status(400).send("Invalid URL");
-    return;
+    return res.status(400).send("Invalid URL");
   }
 
   const headers = sanitizeRequestHeaders(req, target);
@@ -141,7 +114,7 @@ app.all("/proxy", async (req: Request, res: Response) => {
     httpsAgent
   };
 
-  if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+  if (req.method !== "GET" && req.method !== "HEAD") {
     config.data = req.body;
   }
 
@@ -150,108 +123,84 @@ app.all("/proxy", async (req: Request, res: Response) => {
 
     const status = upstream.status;
     const ct = String(upstream.headers["content-type"] || "");
-    const isHtml = ct.includes("text/html");
-    const isJs =
-      ct.includes("application/javascript") || ct.includes("text/javascript");
-    const isCss = ct.includes("text/css");
 
     stripDangerousResponseHeaders(upstream.headers, res);
     setCommonHeaders(res);
 
-    const buf: Buffer = upstream.data as Buffer;
+    const buf: Buffer = upstream.data;
+
+    const isHtml = ct.includes("text/html");
+    const isJs = ct.includes("javascript");
+    const isCss = ct.includes("text/css");
 
     if (isHtml || isJs || isCss) {
       let text = buf.toString("utf8");
-      if (isHtml) text = rewriteHtml(text, target);
-      else if (isJs) text = rewriteJs(text, target);
-      else if (isCss) text = rewriteCss(text, target);
 
-      const safeCt =
-        ct.replace(/;\s*charset=[^;]+/i, "") + "; charset=utf-8";
+      if (isHtml) text = rewriteHtml(text, target);
+      if (isJs) text = rewriteJs(text, target);
+      if (isCss) text = rewriteCss(text, target);
+
+      const safeCt = ct.replace(/;\s*charset=[^;]+/i, "") + "; charset=utf-8";
       res.status(status).setHeader("content-type", safeCt);
-      res.send(text);
-    } else {
-      res.status(status);
-      res.send(buf);
+      return res.send(text);
     }
+
+    res.status(status).send(buf);
   } catch (err: any) {
     console.error("Proxy error:", err?.message || err);
     res.status(502).send("Upstream error");
   }
 });
 
-/**
- * WebSocket proxy for things like Discord gateways, etc.
- *
- * runtime.js wraps WebSocket URLs with /proxy_ws?url=...
- */
-const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
 
+// ===============
+// REAL WS TUNNEL
+// ===============
+
+const server = http.createServer(app);
+
+/**
+ * WARNING:
+ * This is the ONLY correct approach.
+ * You MUST pipe raw TCP → raw TCP.
+ */
 server.on("upgrade", (req, socket, head) => {
   try {
-    const url = new URL(req.url || "", "http://local/");
-    if (url.pathname !== "/proxy_ws") {
-      socket.destroy();
-      return;
-    }
+    const url = new URL("http://host" + req.url);
+    if (url.pathname !== "/proxy_ws") return socket.destroy();
 
-    const raw = url.searchParams.get("url");
-    if (!raw) {
-      socket.destroy();
-      return;
-    }
+    const target = url.searchParams.get("url");
+    if (!target) return socket.destroy();
 
-    let target: URL;
-    try {
-      target = new URL(raw);
-    } catch {
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket as any, head, (client) => {
-      const upstream = new WebSocket(target.href, {
-        rejectUnauthorized: false,
-        headers: {
-          "User-Agent":
-            req.headers["user-agent"] || "Mozilla/5.0 scramjet-lite-ws"
-        }
-      });
-
-      upstream.on("open", () => {
-        client.on("message", (msg) => upstream.send(msg));
-      });
-
-      upstream.on("message", (msg) => {
-        try {
-          client.send(msg);
-        } catch {
-        }
-      });
-
-      const closeBoth = () => {
-        try {
-          client.close();
-        } catch {}
-        try {
-          upstream.close();
-        } catch {}
-      };
-
-      upstream.on("close", closeBoth);
-      upstream.on("error", closeBoth);
-      client.on("close", closeBoth);
-      client.on("error", closeBoth);
+    const upstream = new WebSocket(target, {
+      rejectUnauthorized: false,
+      headers: {
+        "User-Agent": req.headers["user-agent"] || "Mozilla",
+        "Origin": new URL(target).origin
+      }
     });
-  } catch (e) {
-    console.error("WS upgrade error:", e);
-    try {
-      socket.destroy();
-    } catch {}
+
+    upstream.on("open", () => {
+      // Accept the WebSocket handshake manually
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          "\r\n"
+      );
+
+      // RAW piping: THIS is what Discord requires.
+      (socket as any).pipe((upstream as any)._socket).pipe(socket);
+    });
+
+    upstream.on("error", () => socket.destroy());
+    upstream.on("close", () => socket.end());
+    socket.on("error", () => upstream.terminate());
+  } catch (err) {
+    socket.destroy();
   }
 });
 
-server.listen(PORT, () => {
-  console.log("Proxy running on http://localhost:" + PORT);
-});
+server.listen(PORT, () =>
+  console.log("Proxy running on http://localhost:" + PORT)
+);

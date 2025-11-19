@@ -53,8 +53,7 @@
 
   function absolutizeWsUrl(raw) {
     if (raw == null) return raw;
-    if (raw instanceof URL)
-      return raw.href.replace(/^http/, "ws");
+    if (raw instanceof URL) return raw.href.replace(/^http/, "ws");
 
     const value = String(raw).trim();
     if (/^ws(s)?:\/\//i.test(value)) return value;
@@ -152,9 +151,7 @@
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const element = node;
     proxifyElement(element);
-    element
-      .querySelectorAll(PROXIED_NODE_SELECTOR)
-      .forEach(proxifyElement);
+    element.querySelectorAll(PROXIED_NODE_SELECTOR).forEach(proxifyElement);
   }
 
   Element.prototype.setAttribute = function (name, value) {
@@ -165,7 +162,7 @@
         return originalSetAttribute.call(this, name, rewritten);
       }
     }
-    if ( MONITORED_ATTRS.has(lower) && shouldProxy(value)) {
+    if (MONITORED_ATTRS.has(lower) && shouldProxy(value)) {
       value = wrapHttp(value);
     }
     return originalSetAttribute.call(this, name, value);
@@ -187,7 +184,7 @@
           value = wrapper(value);
         }
         return descriptor.set.call(this, value);
-      }
+      },
     });
   }
 
@@ -202,7 +199,7 @@
       get: descriptor.get,
       set(value) {
         return descriptor.set.call(this, rewriteSrcSet(String(value)));
-      }
+      },
     });
   }
 
@@ -220,7 +217,6 @@
   patchSrcSetProperty(HTMLImageElement, "srcset");
   patchSrcSetProperty(HTMLSourceElement, "srcset");
 
-
   window.__proxy_fetch = function (input, init = {}) {
     if (input instanceof Request) {
       const proxied = wrapHttp(input.url);
@@ -230,7 +226,7 @@
         body:
           input.method === "GET" || input.method === "HEAD"
             ? undefined
-            : input.body
+            : input.body,
       };
       const nextInit = { ...derivedInit, ...init };
       return nativeFetch(proxied, nextInit);
@@ -301,6 +297,7 @@
     window.EventSource = ProxyEventSource;
   }
 
+  // *** CHANGED: serviceWorker shim no longer returns a fake registration ***
   try {
     if (
       navigator.serviceWorker &&
@@ -318,20 +315,8 @@
             err
           );
         }
-        return origRegister(scriptURL, options).catch((e) => {
-          console.warn(
-            "[runtime] serviceWorker.register failed, returning dummy registration",
-            e
-          );
-          return Promise.resolve({
-            scope: (options && options.scope) || "/",
-            unregister: async () => true,
-            update: async () => {},
-            installing: null,
-            waiting: null,
-            active: null
-          });
-        });
+        // Do NOT swallow failures – let the promise reject normally.
+        return origRegister(scriptURL, options);
       };
     }
   } catch (err) {
@@ -381,14 +366,31 @@
       Object.defineProperty(Location.prototype, "href", {
         configurable: true,
         enumerable: descriptor.enumerable,
-        get: descriptor.get,
+        get() {
+          return window.__proxy_target || descriptor.get.call(this);
+        },
         set(value) {
           descriptor.set.call(this, wrapHttp(value));
-        }
+        },
       });
     }
   } catch (err) {
     console.warn("[runtime] failed to patch Location.href", err);
+  }
+
+  if (window.__proxy_target) {
+    try {
+      const targetUrl = new URL(window.__proxy_target);
+      const props = ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'];
+      props.forEach(prop => {
+        Object.defineProperty(window.location, prop, {
+          get: () => targetUrl[prop],
+          configurable: true
+        });
+      });
+    } catch (err) {
+      console.warn("[runtime] failed to spoof location properties", err);
+    }
   }
 
   if (nativeWindowOpen) {
@@ -414,7 +416,7 @@
   });
   observer.observe(document.documentElement, {
     childList: true,
-    subtree: true
+    subtree: true,
   });
 
   window.__proxy_import = function (url) {

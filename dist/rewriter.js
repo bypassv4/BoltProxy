@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.wrap = wrap;
+exports.wrapWs = wrapWs;
 exports.absolutize = absolutize;
 exports.rewriteHtml = rewriteHtml;
 exports.rewriteJs = rewriteJs;
@@ -9,6 +10,10 @@ const url_1 = require("url");
 const NON_PROXY_SCHEMES = /^(?:data|javascript|mailto|tel|blob):/i;
 function wrap(url) {
     return "/proxy?url=" + encodeURIComponent(url);
+}
+// NEW: dedicated wrapper for websocket endpoints
+function wrapWs(url) {
+    return "/proxy_ws?url=" + encodeURIComponent(url);
 }
 function absolutize(base, raw) {
     const value = raw.trim();
@@ -80,9 +85,20 @@ function rewriteHtml(html, base) {
     return html;
 }
 /**
- * JS rewriter: conservative – runtime.js does the heavy lifting.
+ * JS rewriter:
+ * - keep as-is for most code
+ * - PLUS rewrite literal WebSocket("wss://…") calls to go through /proxy_ws
  */
-function rewriteJs(js, _base) {
+function rewriteJs(js, base) {
+    // Rewrite: new WebSocket("wss://example.com/…")
+    js = js.replace(/new\s+WebSocket\s*\(\s*(["'])([^"']+)\1\s*\)/gi, (match, quote, rawUrl) => {
+        const cleaned = String(rawUrl || "").trim();
+        if (!shouldProxyResource(cleaned))
+            return match;
+        const abs = absolutize(base, cleaned);
+        const proxied = wrapWs(abs);
+        return `new WebSocket(${quote}${proxied}${quote})`;
+    });
     return js;
 }
 /**
