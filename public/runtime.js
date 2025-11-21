@@ -11,11 +11,20 @@
   const nativeLocationReplace = window.location.replace.bind(window.location);
   const nativeWindowOpen =
     typeof window.open === "function" ? window.open.bind(window) : null;
+  const nativeLocationHrefDescriptor = Object.getOwnPropertyDescriptor(
+    Location.prototype,
+    "href"
+  );
+  const nativeLocationHrefGetter =
+    nativeLocationHrefDescriptor && typeof nativeLocationHrefDescriptor.get === "function"
+      ? nativeLocationHrefDescriptor.get.bind(window.location)
+      : null;
 
   const ABSOLUTE_PROTOCOL_REGEX = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
   const NON_PROXY_SCHEMES = /^(?:data|javascript|mailto|tel|blob):/i;
   const PROXY_PREFIX = "/proxy?url=";
   const PROXY_WS_PREFIX = "/proxy_ws?url=";
+  const PROXY_COOKIE_PREFIX = "__bpck__";
 
   const PROXIED_NODE_SELECTOR =
     "img,script,link,iframe,video,audio,source,track,form,a";
@@ -23,8 +32,57 @@
 
   const originalSetAttribute = Element.prototype.setAttribute;
 
-  function resolveBaseOrigin() {
-    return window.__proxy_target || window.location.origin;
+  function resolveBaseUrl() {
+    try {
+      return window.__proxy_target || readNativeLocationHref();
+    } catch {
+      return readNativeLocationHref();
+    }
+  }
+
+  function rewriteHistoryUrl(value) {
+    if (value == null) return null;
+    if (value instanceof URL) {
+      setTargetUrl(value);
+      return wrapHttp(value);
+    }
+
+    const str = String(value).trim();
+    if (!shouldProxy(str)) return null;
+    const absolute = absolutizeHttpUrl(str);
+    if (!absolute) return null;
+    setTargetUrl(absolute);
+    return wrapHttp(absolute);
+  }
+
+  function patchHistoryMethod(method) {
+    const native = history[method];
+    if (typeof native !== "function") return;
+
+    history[method] = function (...args) {
+      if (args.length > 2 && args[2] != null) {
+        try {
+          const rewritten = rewriteHistoryUrl(args[2]);
+          if (rewritten) {
+            args[2] = rewritten;
+          }
+        } catch (err) {
+          console.warn(`[runtime] failed to rewrite history.${method}`, err);
+        }
+      }
+      return native.apply(this, args);
+    };
+  }
+
+  function readNativeLocationHref() {
+    if (nativeLocationHrefGetter) {
+      try {
+        return nativeLocationHrefGetter();
+      } catch {
+        // ignore
+      }
+    }
+    return window.location.href;
   }
 
   function absolutizeHttpUrl(raw) {
@@ -37,7 +95,7 @@
 
     if (value.startsWith("//")) {
       try {
-        const base = new URL(resolveBaseOrigin());
+        const base = new URL(resolveBaseUrl());
         return base.protocol + value;
       } catch {
         return window.location.protocol + value;
@@ -45,7 +103,7 @@
     }
 
     try {
-      return new URL(value, resolveBaseOrigin()).href;
+      return new URL(value, resolveBaseUrl()).href;
     } catch {
       return value;
     }
@@ -59,7 +117,7 @@
     if (/^ws(s)?:\/\//i.test(value)) return value;
 
     try {
-      const httpUrl = new URL(value, resolveBaseOrigin());
+      const httpUrl = new URL(value, resolveBaseUrl());
       httpUrl.protocol = httpUrl.protocol === "https:" ? "wss:" : "ws:";
       return httpUrl.href;
     } catch {
@@ -84,6 +142,206 @@
     const trimmed = value.trim();
     if (!trimmed || trimmed.startsWith("#")) return false;
     return !NON_PROXY_SCHEMES.test(trimmed);
+  }
+
+  function base64UrlEncode(str) {
+    const base64 = btoa(unescape(encodeURIComponent(str)));
+    return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function base64UrlDecode(str) {
+    let base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) {
+      base64 += "=";
+    }
+    return decodeURIComponent(escape(atob(base64)));
+  }
+
+  function parseCookiePairs(header) {
+    if (!header) return [];
+    return header
+      .split(";")
+      .map((part) => part.trim())
+      .map((part) => {
+        const eq = part.indexOf("=");
+        if (eq === -1) return null;
+        const name = part.slice(0, eq).trim();
+        const value = part.slice(eq + 1).trim();
+        if (!name) return null;
+        return { name, value };
+      })
+      .filter(Boolean);
+  }
+
+  function getTargetUrl() {
+    const base = window.__proxy_target || readNativeLocationHref();
+    try {
+      return new URL(base);
+    } catch {
+      return new URL(readNativeLocationHref());
+    }
+  }
+
+  function setTargetUrl(value) {
+    try {
+      const next =
+        value instanceof URL ? value : new URL(String(value), getTargetUrl());
+      window.__proxy_target = next.href;
+      return next;
+    } catch {
+      return null;
+    }
+  }
+
+  function decodeCookieMeta(raw) {
+    try {
+      const json = base64UrlDecode(raw);
+      const parsed = JSON.parse(json);
+      if (
+        !parsed ||
+        typeof parsed.name !== "string" ||
+        typeof parsed.domain !== "string" ||
+        typeof parsed.path !== "string"
+      ) {
+        return null;
+      }
+      return {
+        name: parsed.name,
+        domain: parsed.domain,
+        path: parsed.path,
+        hostOnly: Boolean(parsed.hostOnly)
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function domainMatches(targetHost, cookieDomain, hostOnly) {
+    const host = targetHost.toLowerCase();
+    const domain = cookieDomain.toLowerCase();
+    if (hostOnly) return host === domain;
+    return host === domain || host.endsWith("." + domain);
+  }
+
+  function pathMatches(targetPath, cookiePath) {
+    const normalizedCookiePath = cookiePath || "/";
+    const normalizedTargetPath = targetPath.startsWith("/")
+      ? targetPath
+      : "/" + targetPath;
+    if (!normalizedTargetPath.startsWith(normalizedCookiePath)) return false;
+    if (normalizedCookiePath.endsWith("/")) return true;
+    if (normalizedTargetPath.length === normalizedCookiePath.length) return true;
+    return normalizedTargetPath[normalizedCookiePath.length] === "/";
+  }
+
+  function formatDocumentCookie(raw) {
+    const target = getTargetUrl();
+    const host = target.hostname.toLowerCase();
+    const path = target.pathname || "/";
+    const pairs = parseCookiePairs(raw);
+    const out = [];
+    for (const entry of pairs) {
+      if (!entry || !entry.name.startsWith(PROXY_COOKIE_PREFIX)) continue;
+      const meta = decodeCookieMeta(
+        entry.name.slice(PROXY_COOKIE_PREFIX.length)
+      );
+      if (!meta) continue;
+      if (!domainMatches(host, meta.domain, meta.hostOnly)) continue;
+      if (!pathMatches(path, meta.path)) continue;
+      try {
+        const actualValue = base64UrlDecode(entry.value);
+        out.push(`${meta.name}=${actualValue}`);
+      } catch {
+        continue;
+      }
+    }
+    return out.join("; ");
+  }
+
+  function parseCookieAssignment(raw) {
+    if (!raw) return null;
+    const segments = raw.split(";").map((part) => part.trim()).filter(Boolean);
+    if (!segments.length) return null;
+    const [nameValue, ...attrs] = segments;
+    const eq = nameValue.indexOf("=");
+    if (eq === -1) return null;
+    const name = nameValue.slice(0, eq).trim();
+    const value = nameValue.slice(eq + 1);
+    const parsed = {
+      name,
+      value,
+      path: "/",
+      domain: null,
+      expires: undefined,
+      maxAge: undefined,
+      sameSite: undefined,
+      secure: false
+    };
+
+    for (const attr of attrs) {
+      const [attrNameRaw, ...rest] = attr.split("=");
+      const attrName = attrNameRaw.trim().toLowerCase();
+      const attrValue = rest.join("=");
+      switch (attrName) {
+        case "path":
+          parsed.path = attrValue || "/";
+          break;
+        case "domain":
+          parsed.domain = attrValue ? attrValue.replace(/^\./, "") : null;
+          break;
+        case "expires":
+          parsed.expires = attrValue;
+          break;
+        case "max-age":
+          parsed.maxAge = attrValue;
+          break;
+        case "samesite":
+          parsed.sameSite = attrValue;
+          break;
+        case "secure":
+          parsed.secure = true;
+          break;
+        default:
+          break;
+      }
+    }
+
+    return parsed;
+  }
+
+  function rewriteDocumentCookie(value) {
+    const parsed = parseCookieAssignment(value);
+    if (!parsed) return value;
+    const target = getTargetUrl();
+    const domain =
+      parsed.domain?.trim().toLowerCase() || target.hostname.toLowerCase();
+    const hostOnly = !parsed.domain;
+    const meta = {
+      name: parsed.name,
+      domain,
+      path: parsed.path || "/",
+      hostOnly
+    };
+
+    const encodedName = `${PROXY_COOKIE_PREFIX}${base64UrlEncode(
+      JSON.stringify(meta)
+    )}`;
+    const encodedValue = base64UrlEncode(parsed.value);
+    const segments = [`${encodedName}=${encodedValue}`, "Path=/"];
+    if (parsed.expires) segments.push(`Expires=${parsed.expires}`);
+    if (parsed.maxAge != null) segments.push(`Max-Age=${parsed.maxAge}`);
+
+    if (parsed.sameSite) {
+      const lower = parsed.sameSite.toLowerCase();
+      if (!(lower === "none" && !window.isSecureContext)) {
+        segments.push(`SameSite=${parsed.sameSite}`);
+      }
+    }
+    if (parsed.secure && window.isSecureContext) {
+      segments.push("Secure");
+    }
+
+    return segments.join("; ");
   }
 
   function rewriteSrcSet(value) {
@@ -203,6 +461,47 @@
     });
   }
 
+  function patchDocumentCookie() {
+    if (typeof Document === "undefined") return;
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+    if (!descriptor) return;
+
+    Object.defineProperty(Document.prototype, "cookie", {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get() {
+        if (typeof descriptor.get !== "function") return "";
+        if (!window.__proxy_target) {
+          return descriptor.get.call(this);
+        }
+        try {
+          const raw = descriptor.get.call(this);
+          return formatDocumentCookie(raw);
+        } catch (err) {
+          console.warn("[runtime] failed to read document.cookie", err);
+          return descriptor.get.call(this);
+        }
+      },
+      set(value) {
+        if (typeof descriptor.set !== "function") return value;
+        if (!window.__proxy_target) {
+          return descriptor.set.call(this, value);
+        }
+        try {
+          const rewritten = rewriteDocumentCookie(value);
+          return descriptor.set.call(this, rewritten);
+        } catch (err) {
+          console.warn("[runtime] failed to rewrite document.cookie", err);
+          return descriptor.set.call(this, value);
+        }
+      },
+    });
+  }
+
+  patchDocumentCookie();
+  patchHistoryMethod("pushState");
+  patchHistoryMethod("replaceState");
+
   patchUrlProperty(HTMLScriptElement, "src", wrapHttp);
   patchUrlProperty(HTMLLinkElement, "href", wrapHttp);
   patchUrlProperty(HTMLImageElement, "src", wrapHttp);
@@ -219,17 +518,13 @@
 
   window.__proxy_fetch = function (input, init = {}) {
     if (input instanceof Request) {
-      const proxied = wrapHttp(input.url);
-      const derivedInit = {
-        method: input.method,
-        headers: new Headers(input.headers),
-        body:
-          input.method === "GET" || input.method === "HEAD"
-            ? undefined
-            : input.body,
-      };
-      const nextInit = { ...derivedInit, ...init };
-      return nativeFetch(proxied, nextInit);
+      const proxiedUrl = wrapHttp(input.url);
+      // Preserve all request options (credentials, mode, redirect, integrity, etc.)
+      // by cloning the original Request when swapping the URL.
+      const cloned = new Request(proxiedUrl, input);
+      const finalRequest =
+        init && Object.keys(init).length ? new Request(cloned, init) : cloned;
+      return nativeFetch(finalRequest);
     }
 
     const target = input instanceof URL ? input.href : input;
@@ -361,13 +656,17 @@
   };
 
   try {
-    const descriptor = Object.getOwnPropertyDescriptor(Location.prototype, "href");
-    if (descriptor && descriptor.set) {
+    const descriptor = nativeLocationHrefDescriptor;
+    if (descriptor && descriptor.set && descriptor.get) {
       Object.defineProperty(Location.prototype, "href", {
         configurable: true,
         enumerable: descriptor.enumerable,
         get() {
-          return window.__proxy_target || descriptor.get.call(this);
+          try {
+            return getTargetUrl().href;
+          } catch {
+            return descriptor.get.call(this);
+          }
         },
         set(value) {
           descriptor.set.call(this, wrapHttp(value));
@@ -378,20 +677,41 @@
     console.warn("[runtime] failed to patch Location.href", err);
   }
 
-  if (window.__proxy_target) {
-    try {
-      const targetUrl = new URL(window.__proxy_target);
-      const props = ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'];
-      props.forEach(prop => {
-        Object.defineProperty(window.location, prop, {
-          get: () => targetUrl[prop],
-          configurable: true
+  function patchLocationGetters() {
+    const props = [
+      "protocol",
+      "host",
+      "hostname",
+      "port",
+      "pathname",
+      "search",
+      "hash",
+      "origin"
+    ];
+
+    props.forEach((prop) => {
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(Location.prototype, prop);
+        if (!descriptor || typeof descriptor.get !== "function") return;
+        Object.defineProperty(Location.prototype, prop, {
+          configurable: true,
+          enumerable: descriptor.enumerable,
+          get() {
+            try {
+              const target = getTargetUrl();
+              return target[prop];
+            } catch {
+              return descriptor.get.call(this);
+            }
+          },
         });
-      });
-    } catch (err) {
-      console.warn("[runtime] failed to spoof location properties", err);
-    }
+      } catch (err) {
+        console.warn(`[runtime] failed to patch Location.${prop}`, err);
+      }
+    });
   }
+
+  patchLocationGetters();
 
   if (nativeWindowOpen) {
     window.open = function (url, target, features) {

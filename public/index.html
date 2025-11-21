@@ -6,21 +6,26 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div class="chrome">
-    <div class="toolbar">
-      <div class="dots">
-        <span class="dot red"></span>
-        <span class="dot yellow"></span>
-        <span class="dot green"></span>
+  <div class="shell">
+    <div class="tab-strip">
+      <div class="tabs" id="tabs"></div>
+      <button class="tab-add" id="new-tab" type="button" aria-label="New tab">+</button>
+    </div>
+
+    <form class="nav-bar" id="url-form" autocomplete="off">
+      <div class="nav-buttons">
+        <button class="nav-btn" id="back" type="button" aria-label="Back">←</button>
+        <button class="nav-btn" id="forward" type="button" aria-label="Forward">→</button>
+        <button class="nav-btn" id="reload" type="button" aria-label="Reload">⟳</button>
       </div>
-      <form id="url-form">
-        <input id="url-input" type="text" placeholder="Enter a URL (example.com, https://blooket.com, etc.)">
-        <button type="submit">Go</button>
-      </form>
-    </div>
-    <div class="info">
-      <p>All pages load through this proxy. Links should stay inside BoltProxy.</p>
-    </div>
+      <div class="address">
+        <span class="hint-chip">https://</span>
+        <input id="url-input" type="text" placeholder="Enter a site or paste a link" spellcheck="false">
+      </div>
+      <button class="go" type="submit">Go</button>
+    </form>
+
+    <div class="viewport" id="viewport"></div>
   </div>
   <script src="/app.js"></script>
 </body>

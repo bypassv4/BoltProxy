@@ -4,12 +4,25 @@ import path from "path";
 import { URL } from "url";
 import http from "http";
 import https from "https";
-import WebSocket from "ws";
+import net from "net";
+import tls from "tls";
+import type { Socket } from "net";
 
 import { rewriteHtml, rewriteJs, rewriteCss } from "./rewriters";
+import {
+  buildUpstreamCookieHeader,
+  rewriteSetCookieHeaders
+} from "./utils/cookies";
+import {
+  wrap,
+  absolutize,
+  shouldProxyResource
+} from "./utils/shared";
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132 Safari/537.36";
 
 app.use(
   express.raw({
@@ -34,6 +47,92 @@ function setCommonHeaders(res: Response) {
   res.setHeader("cross-origin-resource-policy", "cross-origin");
 }
 
+function failWebSocketUpgrade(socket: Socket, statusCode: number, reason: string) {
+  try {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${reason}\r\n` +
+        "Connection: close\r\n" +
+        "\r\n"
+    );
+  } catch {
+    // ignore
+  }
+  socket.destroy();
+}
+
+function coalesceCookieHeader(value: string | string[] | undefined) {
+  if (!value) return undefined;
+  return Array.isArray(value) ? value.join(";") : value;
+}
+
+const CONTROLLED_WS_HEADERS = new Set([
+  "host",
+  "connection",
+  "upgrade",
+  "origin",
+  "cookie",
+  "user-agent",
+  "sec-websocket-key",
+  "sec-websocket-version",
+  "sec-websocket-extensions",
+  "sec-websocket-protocol",
+  "sec-fetch-site",
+  "sec-fetch-mode",
+  "sec-fetch-dest"
+]);
+
+const HEADER_CASE_OVERRIDES: Record<string, string> = {
+  "sec-websocket-key": "Sec-WebSocket-Key",
+  "sec-websocket-version": "Sec-WebSocket-Version",
+  "sec-websocket-extensions": "Sec-WebSocket-Extensions",
+  "sec-websocket-protocol": "Sec-WebSocket-Protocol",
+  "content-md5": "Content-MD5",
+  "dnt": "DNT",
+  "te": "TE",
+  "www-authenticate": "WWW-Authenticate",
+  "x-dns-prefetch-control": "X-DNS-Prefetch-Control"
+};
+
+function formatHeaderName(name: string) {
+  const lower = name.toLowerCase();
+  if (HEADER_CASE_OVERRIDES[lower]) return HEADER_CASE_OVERRIDES[lower];
+  return lower
+    .split("-")
+    .map((part) => {
+      if (!part) return part;
+      return part[0].toUpperCase() + part.slice(1);
+    })
+    .join("-");
+}
+
+function rewriteLocationHeader(
+  value: string | string[] | undefined,
+  base: URL
+) {
+  if (!value) return undefined;
+  const raw = Array.isArray(value) ? value[0] : String(value);
+  if (!shouldProxyResource(raw)) return raw;
+  try {
+    const abs = absolutize(base, raw);
+    if (!abs) return raw;
+    return wrap(abs);
+  } catch {
+    return raw;
+  }
+}
+
+function isSecureRequest(req: Request) {
+  if (req.secure) return true;
+  const forwarded = req.headers["x-forwarded-proto"];
+  if (Array.isArray(forwarded)) {
+    return forwarded.some((value) => value?.toLowerCase() === "https");
+  }
+  if (typeof forwarded === "string") {
+    return forwarded.toLowerCase() === "https";
+  }
+  return false;
+}
+
 function sanitizeRequestHeaders(req: Request, target: URL) {
   const out: Record<string, string> = {};
 
@@ -47,7 +146,8 @@ function sanitizeRequestHeaders(req: Request, target: URL) {
         "connection",
         "content-length",
         "accept-encoding",
-        "upgrade"
+        "upgrade",
+        "cookie"
       ].includes(lower)
     )
       continue;
@@ -60,8 +160,16 @@ function sanitizeRequestHeaders(req: Request, target: URL) {
   out["origin"] = target.origin;
 
   if (!out["user-agent"]) {
-    out["user-agent"] =
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132 Safari/537.36";
+    out["user-agent"] = DEFAULT_USER_AGENT;
+  }
+
+  const cookieHeader = buildUpstreamCookieHeader(
+    coalesceCookieHeader(req.headers.cookie),
+    target
+  );
+
+  if (cookieHeader) {
+    out["cookie"] = cookieHeader;
   }
 
   return out;
@@ -82,7 +190,8 @@ function stripDangerousResponseHeaders(upHeaders: any, res: Response) {
         "content-length",
         "content-encoding",
         "transfer-encoding",
-        "connection"
+        "connection",
+        "set-cookie"
       ].includes(lower)
     )
       continue;
@@ -103,6 +212,7 @@ app.all("/proxy", async (req, res) => {
   }
 
   const headers = sanitizeRequestHeaders(req, target);
+  const secureProxy = isSecureRequest(req);
 
   const config: AxiosRequestConfig = {
     url: target.href,
@@ -111,7 +221,8 @@ app.all("/proxy", async (req, res) => {
     responseType: "arraybuffer",
     validateStatus: () => true,
     httpAgent,
-    httpsAgent
+    httpsAgent,
+    maxRedirects: 0
   };
 
   if (req.method !== "GET" && req.method !== "HEAD") {
@@ -126,6 +237,21 @@ app.all("/proxy", async (req, res) => {
 
     stripDangerousResponseHeaders(upstream.headers, res);
     setCommonHeaders(res);
+    const rewrittenSetCookies = rewriteSetCookieHeaders(
+      upstream.headers["set-cookie"],
+      target,
+      { secureProxy }
+    );
+    if (rewrittenSetCookies.length) {
+      res.setHeader("set-cookie", rewrittenSetCookies);
+    }
+    const rewrittenLocation = rewriteLocationHeader(
+      upstream.headers["location"],
+      target
+    );
+    if (rewrittenLocation) {
+      res.setHeader("location", rewrittenLocation);
+    }
 
     const buf: Buffer = upstream.data;
 
@@ -153,51 +279,150 @@ app.all("/proxy", async (req, res) => {
 });
 
 
-// ===============
-// REAL WS TUNNEL
-// ===============
+/**
+ * ======================================================
+ * REAL RAW WEBSOCKET TUNNEL (Discord-safe)
+ * ======================================================
+ */
 
 const server = http.createServer(app);
 
-/**
- * WARNING:
- * This is the ONLY correct approach.
- * You MUST pipe raw TCP → raw TCP.
- */
-server.on("upgrade", (req, socket, head) => {
+server.on("upgrade", (req, socket: Socket, head) => {
+  const reject = (code: number, reason: string) =>
+    failWebSocketUpgrade(socket, code, reason);
+
   try {
-    const url = new URL("http://host" + req.url);
-    if (url.pathname !== "/proxy_ws") return socket.destroy();
+    const localUrl = new URL("http://local" + (req.url || ""));
+    if (localUrl.pathname !== "/proxy_ws") {
+      return reject(404, "Not Found");
+    }
 
-    const target = url.searchParams.get("url");
-    if (!target) return socket.destroy();
+    const targetRaw = localUrl.searchParams.get("url");
+    if (!targetRaw) {
+      return reject(400, "Missing Target");
+    }
 
-    const upstream = new WebSocket(target, {
-      rejectUnauthorized: false,
-      headers: {
-        "User-Agent": req.headers["user-agent"] || "Mozilla",
-        "Origin": new URL(target).origin
+    const target = new URL(targetRaw);
+    const clientKey = req.headers["sec-websocket-key"];
+    if (!clientKey || Array.isArray(clientKey)) {
+      return reject(400, "Missing WebSocket Key");
+    }
+
+    const upstreamPath = `${target.pathname || "/"}${target.search || ""}`;
+    const isSecure = target.protocol === "wss:";
+    const port = Number(target.port || (isSecure ? 443 : 80));
+
+    const cookieHeader = buildUpstreamCookieHeader(
+      coalesceCookieHeader(req.headers.cookie),
+      target
+    );
+
+    const headers: string[] = [
+      `GET ${upstreamPath || "/"} HTTP/1.1`,
+      `Host: ${target.host}`,
+      "Connection: Upgrade",
+      "Upgrade: websocket"
+    ];
+
+    const forwardHeader = (label: string, value?: string | string[]) => {
+      if (!value) return;
+      const normalized = Array.isArray(value) ? value.join(", ") : String(value);
+      if (!normalized) return;
+      headers.push(`${label}: ${normalized}`);
+    };
+
+    forwardHeader("Sec-WebSocket-Key", clientKey);
+    forwardHeader(
+      "Sec-WebSocket-Version",
+      req.headers["sec-websocket-version"] as string
+    );
+    forwardHeader(
+      "Sec-WebSocket-Extensions",
+      req.headers["sec-websocket-extensions"] as string
+    );
+    forwardHeader(
+      "Sec-WebSocket-Protocol",
+      req.headers["sec-websocket-protocol"] as string | string[]
+    );
+    forwardHeader(
+      "User-Agent",
+      (req.headers["user-agent"] as string) || DEFAULT_USER_AGENT
+    );
+    if (req.headers["sec-fetch-site"])
+      forwardHeader("Sec-Fetch-Site", req.headers["sec-fetch-site"] as string);
+    if (req.headers["sec-fetch-mode"])
+      forwardHeader("Sec-Fetch-Mode", req.headers["sec-fetch-mode"] as string);
+    if (req.headers["sec-fetch-dest"])
+      forwardHeader("Sec-Fetch-Dest", req.headers["sec-fetch-dest"] as string);
+
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value == null) continue;
+      const lower = name.toLowerCase();
+      if (CONTROLLED_WS_HEADERS.has(lower)) continue;
+      const normalized = Array.isArray(value)
+        ? value.join(", ")
+        : String(value);
+      if (!normalized) continue;
+      headers.push(`${formatHeaderName(lower)}: ${normalized}`);
+    }
+
+    headers.push(`Origin: ${target.origin}`);
+
+    if (cookieHeader) {
+      headers.push(`Cookie: ${cookieHeader}`);
+    }
+
+    headers.push("", "");
+    const requestPayload = headers.join("\r\n");
+
+    const upstream: Socket = isSecure
+      ? (tls.connect({
+        port,
+        host: target.hostname,
+        servername: target.hostname,
+        rejectUnauthorized: false
+      }) as Socket)
+      : net.connect({
+        port,
+        host: target.hostname
+      });
+
+    upstream.setNoDelay(true);
+    socket.setNoDelay(true);
+
+    let tunneled = false;
+    const cleanup = () => {
+      upstream.destroy();
+      socket.destroy();
+    };
+
+    const onConnected = () => {
+      tunneled = true;
+      upstream.write(requestPayload);
+      if (head && head.length) {
+        upstream.write(head);
       }
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+    };
+
+    if (isSecure) {
+      upstream.once("secureConnect", onConnected);
+    } else {
+      upstream.once("connect", onConnected);
+    }
+
+    upstream.on("error", () => {
+      if (!tunneled) {
+        reject(502, "Bad Gateway");
+      }
+      cleanup();
     });
-
-    upstream.on("open", () => {
-      // Accept the WebSocket handshake manually
-      socket.write(
-        "HTTP/1.1 101 Switching Protocols\r\n" +
-          "Upgrade: websocket\r\n" +
-          "Connection: Upgrade\r\n" +
-          "\r\n"
-      );
-
-      // RAW piping: THIS is what Discord requires.
-      (socket as any).pipe((upstream as any)._socket).pipe(socket);
-    });
-
-    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => cleanup());
+    socket.on("close", () => upstream.end());
     upstream.on("close", () => socket.end());
-    socket.on("error", () => upstream.terminate());
   } catch (err) {
-    socket.destroy();
+    reject(502, "Bad Gateway");
   }
 });
 

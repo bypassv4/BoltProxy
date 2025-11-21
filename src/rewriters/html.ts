@@ -1,13 +1,30 @@
 import { URL } from "url";
-import { wrap, absolutize, shouldProxyResource } from "../utils/shared";
 
-export function rewriteHtml(html: string, base: URL): string {
-  html = rewriteAttributes(html, base);
-  html = injectRuntime(html, base);
-  return html;
+const NON_PROXY_SCHEMES = /^(?:data|javascript|mailto|tel|blob):/i;
+
+function wrap(url: string) {
+  return "/proxy?url=" + encodeURIComponent(url);
 }
 
-function rewriteAttributes(html: string, base: URL): string {
+function absolutize(base: URL, raw: string) {
+  const value = raw.trim();
+  if (!value) return value;
+  if (NON_PROXY_SCHEMES.test(value)) return value;
+  if (value.startsWith("http://") || value.startsWith("https://")) return value;
+  if (value.startsWith("//")) return base.protocol + value;
+  if (value.startsWith("/")) return base.origin + value;
+  return new URL(value, base).href;
+}
+
+function shouldProxyResource(raw: string | undefined | null) {
+  if (!raw) return false;
+  const v = raw.trim();
+  if (!v) return false;
+  if (v.startsWith("#")) return false;
+  return !NON_PROXY_SCHEMES.test(v);
+}
+
+function rewriteHtmlAttributes(html: string, base: URL): string {
   type AttrSpec = { tag: string; attrs: string[] };
 
   const specs: AttrSpec[] = [
@@ -29,9 +46,8 @@ function rewriteAttributes(html: string, base: URL): string {
         `(<${spec.tag}\\b[^>]*?\\s${attr}\\s*=\\s*)(["'])([^"']*?)\\2`,
         "gi"
       );
-      html = html.replace(re, (m, prefix, quote, value) => {
-        if (!shouldProxyResource(value)) return m;
-
+      html = html.replace(re, (match, prefix, quote, value) => {
+        if (!shouldProxyResource(value)) return match;
         const abs = absolutize(base, value);
         return `${prefix}${quote}${wrap(abs)}${quote}`;
       });
@@ -42,17 +58,21 @@ function rewriteAttributes(html: string, base: URL): string {
 }
 
 function injectRuntime(html: string, base: URL): string {
-  const script =
+  const injection =
     `<script>window.__proxy_target=${JSON.stringify(base.href)};</script>` +
     `<script src="/runtime.js"></script>`;
 
   if (html.toLowerCase().includes("</head>")) {
-    return html.replace(/<\/head>/i, script + "</head>");
+    return html.replace(/<\/head>/i, injection + "</head>");
   }
-
   if (html.toLowerCase().includes("<body")) {
-    return html.replace(/<body[^>]*>/i, (m) => m + script);
+    return html.replace(/<body[^>]*>/i, (m) => m + injection);
   }
+  return injection + html;
+}
 
-  return script + html;
+export function rewriteHtml(html: string, base: URL): string {
+  html = rewriteHtmlAttributes(html, base);
+  html = injectRuntime(html, base);
+  return html;
 }
