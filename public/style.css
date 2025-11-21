@@ -193,16 +193,6 @@ body {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
-.hint-chip {
-  background: var(--blue-50);
-  color: var(--blue-700);
-  padding: 6px 8px;
-  border-radius: 9px;
-  font-weight: 700;
-  font-size: 12px;
-  border: 1px solid #d7e5ff;
-}
-
 #url-input {
   flex: 1;
   border: none;

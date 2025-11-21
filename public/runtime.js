@@ -32,6 +32,26 @@
 
   const originalSetAttribute = Element.prototype.setAttribute;
 
+  function isAlreadyProxied(url) {
+    if (!url) return false;
+    if (typeof url === "string") {
+      if (url.startsWith(PROXY_PREFIX) || url.startsWith(PROXY_WS_PREFIX)) return true;
+    }
+    try {
+      const abs = new URL(String(url), resolveBaseUrl());
+      return abs.pathname === "/proxy" || abs.pathname === "/proxy_ws";
+    } catch {
+      return false;
+    }
+  }
+
+  // Pretend the page is secure so secure/samesite cookies and captcha flows work.
+  try {
+    Object.defineProperty(window, "isSecureContext", { value: true });
+  } catch {
+    // ignore
+  }
+
   function resolveBaseUrl() {
     try {
       return window.__proxy_target || readNativeLocationHref();
@@ -126,14 +146,16 @@
   }
 
   function wrapHttp(url) {
-    if (typeof url === "string" && url.startsWith(PROXY_PREFIX)) return url;
+    if (isAlreadyProxied(url)) return String(url);
     const absolute = absolutizeHttpUrl(url);
+    if (isAlreadyProxied(absolute)) return String(absolute ?? "");
     return PROXY_PREFIX + encodeURIComponent(String(absolute ?? ""));
   }
 
   function wrapWs(url) {
-    if (typeof url === "string" && url.startsWith(PROXY_WS_PREFIX)) return url;
+    if (isAlreadyProxied(url)) return String(url);
     const absolute = absolutizeWsUrl(url);
+    if (isAlreadyProxied(absolute)) return String(absolute ?? "");
     return PROXY_WS_PREFIX + encodeURIComponent(String(absolute ?? ""));
   }
 
@@ -592,7 +614,7 @@
     window.EventSource = ProxyEventSource;
   }
 
-  // *** CHANGED: serviceWorker shim no longer returns a fake registration ***
+  // serviceWorker: rewrite URL and, if the environment blocks SW (http), return a benign fake registration
   try {
     if (
       navigator.serviceWorker &&
@@ -601,7 +623,16 @@
       const origRegister = navigator.serviceWorker.register.bind(
         navigator.serviceWorker
       );
-      navigator.serviceWorker.register = function (scriptURL, options) {
+      const createFakeRegistration = () => ({
+        installing: null,
+        waiting: null,
+        active: null,
+        scope: resolveBaseUrl(),
+        update: async () => {},
+        unregister: async () => true
+      });
+
+      navigator.serviceWorker.register = async function (scriptURL, options) {
         try {
           scriptURL = wrapHttp(scriptURL);
         } catch (err) {
@@ -610,9 +641,28 @@
             err
           );
         }
-        // Do NOT swallow failures – let the promise reject normally.
-        return origRegister(scriptURL, options);
+        try {
+          return await origRegister(scriptURL, options);
+        } catch (err) {
+          // Insecure origins block SW; provide a harmless fake so callers continue.
+          console.warn("[runtime] serviceWorker register blocked; returning fake", err);
+          return createFakeRegistration();
+        }
       };
+
+      // Ensure navigator.serviceWorker.ready resolves to avoid hangs that expect it.
+      if ("ready" in navigator.serviceWorker) {
+        const readyPromise = Promise.resolve(createFakeRegistration());
+        try {
+          Object.defineProperty(navigator.serviceWorker, "ready", {
+            get() {
+              return readyPromise;
+            }
+          });
+        } catch {
+          // ignore
+        }
+      }
     }
   } catch (err) {
     console.warn("[runtime] serviceWorker shim failed", err);

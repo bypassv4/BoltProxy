@@ -208,12 +208,7 @@ export function rewriteSetCookieHeaders(
 
     let sameSite = parsed.sameSite;
 
-    if (!options.secureProxy) {
-      // Browsers drop SameSite=None cookies without Secure on http origins.
-      if (sameSite && sameSite.toLowerCase() === "none") {
-        sameSite = undefined;
-      }
-    } else if (parsed.secure) {
+    if (parsed.secure) {
       segments.push("Secure");
     }
 
