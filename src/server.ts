@@ -177,7 +177,12 @@ function stripDangerousResponseHeaders(upHeaders: any, res: Response) {
   }
 }
 
-app.all("/proxy", async (req, res) => {
+type ForwardOptions = {
+  overrideMethod?: string;
+  overrideBody?: Buffer | string;
+};
+
+async function handleProxy(req: Request, res: Response, options: ForwardOptions = {}) {
   const raw = String(req.query.url || "");
   if (!raw) return res.status(400).send("Missing ?url=");
 
@@ -190,10 +195,11 @@ app.all("/proxy", async (req, res) => {
 
   const headers = sanitizeRequestHeaders(req, target);
   const secureProxy = isSecureRequest(req);
+  const method = (options.overrideMethod || req.method || "GET").toUpperCase();
 
   const config: AxiosRequestConfig = {
     url: target.href,
-    method: req.method as any,
+    method: method as any,
     headers,
     responseType: "arraybuffer",
     validateStatus: () => true,
@@ -204,9 +210,12 @@ app.all("/proxy", async (req, res) => {
     maxBodyLength: Infinity
   };
 
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    // Forward the exact bytes the client sent; axios will set content-length.
-    config.data = req.body && (req.body as Buffer).length ? req.body : undefined;
+  if (method !== "GET" && method !== "HEAD") {
+    // Prefer an explicit override, then the raw body, then ?data=
+    const queryData = typeof req.query.data === "string" ? req.query.data : undefined;
+    const requestBody =
+      req.body && (req.body as Buffer).length ? (req.body as Buffer) : undefined;
+    config.data = options.overrideBody ?? requestBody ?? queryData;
   }
 
   try {
@@ -256,6 +265,15 @@ app.all("/proxy", async (req, res) => {
     console.error("Proxy error:", err?.message || err);
     res.status(502).send("Upstream error");
   }
+}
+
+app.all("/proxy", async (req, res) => {
+  return handleProxy(req, res);
+});
+
+// Dedicated POST entrypoint so the client can route form/fetch POSTs explicitly.
+app.post("/post", async (req, res) => {
+  return handleProxy(req, res, { overrideMethod: "POST" });
 });
 
 

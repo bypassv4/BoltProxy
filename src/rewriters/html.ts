@@ -1,9 +1,13 @@
 import { URL } from "url";
 
 const NON_PROXY_SCHEMES = /^(?:data|javascript|mailto|tel|blob):/i;
+const PROXY_PREFIX = "/proxy?url=";
+const PROXY_POST_PREFIX = "/post?url=";
 
-function wrap(url: string) {
-  return "/proxy?url=" + encodeURIComponent(url);
+function wrap(url: string, method?: string) {
+  const upper = method ? method.trim().toUpperCase() : "";
+  const prefix = upper === "POST" ? PROXY_POST_PREFIX : PROXY_PREFIX;
+  return prefix + encodeURIComponent(url);
 }
 
 function absolutize(base: URL, raw: string) {
@@ -49,7 +53,12 @@ function rewriteHtmlAttributes(html: string, base: URL): string {
       html = html.replace(re, (match, prefix, quote, value) => {
         if (!shouldProxyResource(value)) return match;
         const abs = absolutize(base, value);
-        return `${prefix}${quote}${wrap(abs)}${quote}`;
+        let method: string | undefined;
+        if (spec.tag === "form" && attr === "action") {
+          const methodMatch = match.match(/\bmethod\s*=\s*["']?([a-z]+)/i);
+          method = methodMatch ? methodMatch[1] : undefined;
+        }
+        return `${prefix}${quote}${wrap(abs, method)}${quote}`;
       });
     }
   }

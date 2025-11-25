@@ -1,6 +1,13 @@
 # BoltProxy
 
-A teaching proxy that rewrites HTML/JS to route all network requests through a local Express server. The app is written in TypeScript so you always edit the sources in `src/` and let the compiler emit runnable JavaScript into `dist/`.
+BoltProxy (v1) is my first attempt at making a web proxy. The source code is written in typescript (ts), however the runtime is written in javascript (js).
+Unfortunately, due to my lack of knowledge for how web proxies work (and not wanting to use uv/scramjet).
+The following don't work or are very buggy:
+Post requests or websockets (i lowk don't know which one it is lmao)
+GitHub (it starts spamming requests and crashes ur browser and I have no clue why but it has something to do with image loading)
+Discord (this is what ive been testing everything on)
+Any captcha (it will just load infinitely)
+Cloudflare sites
 
 ## Prerequisites
 

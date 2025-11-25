@@ -23,6 +23,7 @@
   const ABSOLUTE_PROTOCOL_REGEX = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
   const NON_PROXY_SCHEMES = /^(?:data|javascript|mailto|tel|blob):/i;
   const PROXY_PREFIX = "/proxy?url=";
+  const PROXY_POST_PREFIX = "/post?url=";
   const PROXY_WS_PREFIX = "/proxy_ws?url=";
   const PROXY_COOKIE_PREFIX = "__bpck__";
 
@@ -35,11 +36,16 @@
   function isAlreadyProxied(url) {
     if (!url) return false;
     if (typeof url === "string") {
-      if (url.startsWith(PROXY_PREFIX) || url.startsWith(PROXY_WS_PREFIX)) return true;
+      if (
+        url.startsWith(PROXY_PREFIX) ||
+        url.startsWith(PROXY_POST_PREFIX) ||
+        url.startsWith(PROXY_WS_PREFIX)
+      )
+        return true;
     }
     try {
       const abs = new URL(String(url), resolveBaseUrl());
-      return abs.pathname === "/proxy" || abs.pathname === "/proxy_ws";
+      return abs.pathname === "/proxy" || abs.pathname === "/proxy_ws" || abs.pathname === "/post";
     } catch {
       return false;
     }
@@ -145,11 +151,31 @@
     }
   }
 
-  function wrapHttp(url) {
+  function wrapHttp(url, method = "GET") {
+    const methodUpper = typeof method === "string" ? method.toUpperCase() : "GET";
+    const preferPost = methodUpper === "POST";
+
+    if (preferPost && typeof url === "string" && url.startsWith(PROXY_PREFIX)) {
+      return PROXY_POST_PREFIX + url.slice(PROXY_PREFIX.length);
+    }
+    if (preferPost) {
+      try {
+        const parsed = new URL(String(url), resolveBaseUrl());
+        if (parsed.pathname === "/proxy" && parsed.searchParams.has("url")) {
+          return PROXY_POST_PREFIX + parsed.searchParams.get("url");
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     if (isAlreadyProxied(url)) return String(url);
+
     const absolute = absolutizeHttpUrl(url);
     if (isAlreadyProxied(absolute)) return String(absolute ?? "");
-    return PROXY_PREFIX + encodeURIComponent(String(absolute ?? ""));
+
+    const prefix = preferPost ? PROXY_POST_PREFIX : PROXY_PREFIX;
+    return prefix + encodeURIComponent(String(absolute ?? ""));
   }
 
   function wrapWs(url) {
@@ -385,10 +411,30 @@
       .join(", ");
   }
 
+  function getFormMethod(el) {
+    try {
+      const attrMethod =
+        typeof el.getAttribute === "function" ? el.getAttribute("method") : null;
+      const propMethod = el && "method" in el ? el.method : null;
+      const raw = (attrMethod || propMethod || "").toString().trim();
+      return raw ? raw.toUpperCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function wrapAction(value, el) {
+    const method = getFormMethod(el) || "GET";
+    return wrapHttp(value, method);
+  }
+
   function rewriteElementAttribute(el, attr) {
     if (!el.hasAttribute(attr)) return;
     const value = el.getAttribute(attr);
     if (!shouldProxy(value)) return;
+    if (el.tagName === "FORM" && attr.toLowerCase() === "action") {
+      return originalSetAttribute.call(el, attr, wrapAction(value, el));
+    }
     originalSetAttribute.call(el, attr, wrapHttp(value));
   }
 
@@ -443,7 +489,8 @@
       }
     }
     if (MONITORED_ATTRS.has(lower) && shouldProxy(value)) {
-      value = wrapHttp(value);
+      const isFormAction = lower === "action" && this.tagName === "FORM";
+      value = isFormAction ? wrapAction(value, this) : wrapHttp(value);
     }
     return originalSetAttribute.call(this, name, value);
   };
@@ -459,9 +506,9 @@
       get: descriptor.get,
       set(value) {
         if (typeof value === "string" && shouldProxy(value)) {
-          value = wrapper(value);
+          value = wrapper(value, this);
         } else if (value instanceof URL) {
-          value = wrapper(value);
+          value = wrapper(value, this);
         }
         return descriptor.set.call(this, value);
       },
@@ -533,14 +580,16 @@
   patchUrlProperty(HTMLSourceElement, "src", wrapHttp);
   patchUrlProperty(HTMLTrackElement, "src", wrapHttp);
   patchUrlProperty(HTMLAnchorElement, "href", wrapHttp);
-  patchUrlProperty(HTMLFormElement, "action", wrapHttp);
+  patchUrlProperty(HTMLFormElement, "action", wrapAction);
   patchUrlProperty(HTMLObjectElement, "data", wrapHttp);
   patchSrcSetProperty(HTMLImageElement, "srcset");
   patchSrcSetProperty(HTMLSourceElement, "srcset");
 
   window.__proxy_fetch = function (input, init = {}) {
     if (input instanceof Request) {
-      const proxiedUrl = wrapHttp(input.url);
+      const initMethod = init && init.method ? String(init.method) : null;
+      const method = (initMethod || input.method || "GET").toUpperCase();
+      const proxiedUrl = wrapHttp(input.url, method);
       // Preserve all request options (credentials, mode, redirect, integrity, etc.)
       // by cloning the original Request when swapping the URL.
       const cloned = new Request(proxiedUrl, input);
@@ -550,7 +599,8 @@
     }
 
     const target = input instanceof URL ? input.href : input;
-    return nativeFetch(wrapHttp(target), init);
+    const method = init && init.method ? String(init.method) : "GET";
+    return nativeFetch(wrapHttp(target, method), init);
   };
 
   window.fetch = function (...args) {
@@ -575,7 +625,7 @@
     ) {
       if (url) {
         try {
-          url = wrapHttp(url);
+          url = wrapHttp(url, method);
         } catch (err) {
           console.warn("[runtime] failed to rewrite XHR", err);
         }
@@ -594,7 +644,7 @@
   if (nativeSendBeacon) {
     navigator.sendBeacon = function (url, data) {
       try {
-        url = wrapHttp(url);
+        url = wrapHttp(url, "POST");
       } catch (err) {
         console.warn("[runtime] failed to rewrite sendBeacon", err);
       }
