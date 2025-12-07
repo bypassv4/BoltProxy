@@ -1,3 +1,9 @@
+# I GAVE UP.
+
+
+
+
+
 # BoltProxy
 
 BoltProxy (v1) is my first attempt at making a web proxy. The source code is written in typescript (ts), however the runtime is written in javascript (js).
